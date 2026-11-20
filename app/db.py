@@ -61,10 +61,34 @@ CREATE TABLE IF NOT EXISTS superpositions (
     UNIQUE (site_id, lower_id, upper_id)
 );
 
+-- 浮动树轮年表：每处遗址至多一份（整份替换 = 删除旧行后整体插入）
+CREATE TABLE IF NOT EXISTS chronologies (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id INTEGER NOT NULL UNIQUE REFERENCES sites(id),
+    created TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS chronology_candidates (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    chronology_id INTEGER NOT NULL REFERENCES chronologies(id) ON DELETE CASCADE,
+    start_year    INTEGER NOT NULL,
+    UNIQUE (chronology_id, start_year)
+);
+
+CREATE TABLE IF NOT EXISTS chronology_samples (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    chronology_id INTEGER NOT NULL REFERENCES chronologies(id) ON DELETE CASCADE,
+    stratum_id    INTEGER NOT NULL REFERENCES strata(id),
+    offset_years  INTEGER NOT NULL,
+    UNIQUE (chronology_id, stratum_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_strata_site ON strata(site_id);
 CREATE INDEX IF NOT EXISTS idx_intervals_stratum ON stratum_intervals(stratum_id);
 CREATE INDEX IF NOT EXISTS idx_corr_site ON correlations(site_id);
 CREATE INDEX IF NOT EXISTS idx_sup_site ON superpositions(site_id);
+CREATE INDEX IF NOT EXISTS idx_chrono_cand ON chronology_candidates(chronology_id);
+CREATE INDEX IF NOT EXISTS idx_chrono_sample ON chronology_samples(chronology_id);
 """
 
 
@@ -286,3 +310,57 @@ def list_superpositions(
 
 def delete_superposition(conn: sqlite3.Connection, superposition_id: int) -> None:
     conn.execute("DELETE FROM superpositions WHERE id = ?", (superposition_id,))
+
+
+# ---------- 浮动树轮年表 ----------
+
+def get_chronology(
+    conn: sqlite3.Connection, site_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM chronologies WHERE site_id = ?", (site_id,)
+    ).fetchone()
+
+
+def get_chronology_candidates(
+    conn: sqlite3.Connection, chronology_id: int
+) -> list[int]:
+    rows = conn.execute(
+        "SELECT start_year FROM chronology_candidates "
+        "WHERE chronology_id = ? ORDER BY start_year",
+        (chronology_id,),
+    ).fetchall()
+    return [r["start_year"] for r in rows]
+
+
+def get_chronology_samples(
+    conn: sqlite3.Connection, chronology_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM chronology_samples WHERE chronology_id = ? ORDER BY id",
+        (chronology_id,),
+    ).fetchall()
+
+
+def replace_chronology(
+    conn: sqlite3.Connection,
+    site_id: int,
+    start_years: list[int],
+    samples: list[tuple[int, int]],
+) -> sqlite3.Row:
+    """整份替换该遗址的浮动年表（须在事务内调用，失败随事务回滚）。"""
+    conn.execute("DELETE FROM chronologies WHERE site_id = ?", (site_id,))
+    cur = conn.execute("INSERT INTO chronologies(site_id) VALUES (?)", (site_id,))
+    chronology_id = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO chronology_candidates(chronology_id, start_year) VALUES (?, ?)",
+        [(chronology_id, y) for y in start_years],
+    )
+    conn.executemany(
+        "INSERT INTO chronology_samples(chronology_id, stratum_id, offset_years) "
+        "VALUES (?, ?, ?)",
+        [(chronology_id, sid, off) for sid, off in samples],
+    )
+    return conn.execute(
+        "SELECT * FROM chronologies WHERE id = ?", (chronology_id,)
+    ).fetchone()

@@ -79,6 +79,42 @@ class SuperpositionOut(BaseModel):
     created: str
 
 
+class ChronologySampleIn(BaseModel):
+    stratum_id: int = Field(..., description="木样出土层位 id（须为本遗址现有层位）")
+    offset_years: int = Field(
+        ...,
+        description="木样末轮距年表起点的整年偏移；仅纳入砍伐年可视为该层沉积年的木样",
+    )
+
+
+class ChronologyPut(BaseModel):
+    """浮动树轮年表（每处遗址只保留一份，重复提交整份替换）。"""
+
+    candidate_start_years: list[int] = Field(
+        ..., min_length=1, max_length=20,
+        description="候选公历始年，1～20 个互不相同",
+    )
+    samples: list[ChronologySampleIn] = Field(
+        ..., min_length=2,
+        description="至少两个现有层位各自的木样末轮偏移（沉积年 = 始年 + 偏移）",
+    )
+
+    @field_validator("candidate_start_years")
+    @classmethod
+    def _distinct_years(cls, value: list[int]) -> list[int]:
+        if len(set(value)) != len(value):
+            raise ValueError("候选始年必须互不相同")
+        return value
+
+    @field_validator("samples")
+    @classmethod
+    def _distinct_strata(cls, value: list[ChronologySampleIn]) -> list[ChronologySampleIn]:
+        ids = [s.stratum_id for s in value]
+        if len(set(ids)) != len(ids):
+            raise ValueError("每个层位至多纳入一枚木样")
+        return value
+
+
 class WitnessOut(BaseModel):
     kind: str
     record_id: int
@@ -117,6 +153,10 @@ class SolutionOut(BaseModel):
     contradiction: Optional[ContradictionOut] = None
     earliest_assignment: Optional[dict[str, int]] = None
     latest_assignment: Optional[dict[str, int]] = None
+    feasible_start_years: Optional[list[int]] = Field(
+        None, description="有浮动年表时：全部可行候选始年（升序）；无年表为 null"
+    )
+    chronology: Optional[dict] = Field(None, description="当前生效的浮动年表；无年表为 null")
 
 
 class WriteResult(BaseModel):

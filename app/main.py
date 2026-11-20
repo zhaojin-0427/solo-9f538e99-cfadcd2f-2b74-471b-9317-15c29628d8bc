@@ -1,8 +1,13 @@
 """FastAPI 应用工厂与路由。
 
 并发语义：所有写操作在进程内同一把锁内、同一个 SQLite 事务中完成
-“校验 -> 写入 -> 重算求解 -> 提交”，按提交顺序串行核算。若求解无解，
-事务回滚，库内保留原有对接与年代结论（查询仍返回上一版可行结果）。
+“校验 -> 写入 -> 重算求解 -> 提交”，按提交顺序串行核算。若求解无解
+（有浮动年表时：全部候选始年都不可行），事务回滚，库内保留原有年表、
+对接/叠压关系与年代结论（查询仍返回上一版可行结果）。
+
+浮动树轮年表：每处遗址至多一份，重复提交整份替换。候选始年全部保存在
+库中，每次查询与重启后都由同一份已提交的年表与地层记录现场求解；撤销
+关系只会放松约束，重新符合条件的候选始年会自动回到结果中。
 """
 
 from __future__ import annotations
@@ -16,12 +21,20 @@ from fastapi.responses import JSONResponse
 
 from . import db
 from .schemas import (
+    ChronologyPut,
     CorrelationCreate,
     SiteCreate,
     StratumCreate,
     SuperpositionCreate,
 )
-from .service import load_and_solve, serialize_solution, serialize_stratum
+from .service import (
+    load_chronology,
+    serialize_chronology,
+    serialize_contradiction,
+    serialize_solution,
+    serialize_stratum,
+    solve_site,
+)
 
 MAX_STRATA_PER_SITE = 40
 
@@ -59,13 +72,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
     write_lock = threading.Lock()
 
     app = FastAPI(
-        title="考古地层对接 API",
-        version="1.0.0",
+        title="考古地层对接与树轮定年 API",
+        version="1.1.0",
         description=(
             "录入同一遗址（最多 40 个层位）的探方、层位编号与可能沉积年代段"
             "（整年闭区间，可含空档），登记跨探方层位对接与下层→上层叠压关系；"
-            "直接或间接对接的层位视为同一次沉积并共用一个年份，自动完成分组、"
-            "成环检测与可行年代段计算。"
+            "并可按遗址提交一份浮动树轮年表（1～20 个候选公历始年 + 至少两个"
+            "层位的木样末轮偏移，始年 + 偏移 = 沉积年），全遗址共用同一始年。"
+            "自动完成分组、成环检测、可行始年筛选与可行年代段计算；"
+            "无年表的遗址沿用原行为。"
         ),
     )
     app.state.conn = conn
@@ -88,28 +103,64 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return row
 
     def _solution_payload(site_id: int) -> dict[str, Any]:
-        solution = load_and_solve(conn, site_id)
-        return serialize_solution(solution, db.get_version(conn))
+        verdict = solve_site(conn, site_id)
+        return serialize_solution(verdict, db.get_version(conn))
 
-    def _contradiction_payload(site_id: int) -> dict[str, Any]:
-        """读取当前连接视图（未提交的新记录）中的矛盾见证。"""
-        solution = load_and_solve(conn, site_id)
-        if solution.contradiction is None:  # 理论上不会发生
-            return {"reason": "UNKNOWN", "message": "约束不成立", "witness": []}
-        c = solution.contradiction
-        return {
-            "reason": c.reason,
-            "message": c.message,
-            "witness": [
-                {"kind": w.kind, "record_id": w.record_id, "detail": w.detail}
-                for w in c.witness
-            ],
-        }
+    def _chronology_record(site_id: int) -> dict[str, Any] | None:
+        chrono = load_chronology(conn, site_id)
+        return serialize_chronology(chrono) if chrono else None
 
     def _reject_infeasible(site_id: int, message: str) -> None:
         """事务内调用：先抓取新视图中的矛盾，再抛异常触发事务回滚。"""
-        contradiction = _contradiction_payload(site_id)
-        raise _Infeasible((message, contradiction))
+        verdict = solve_site(conn, site_id)
+        if verdict.contradiction is not None:
+            contradiction = serialize_contradiction(verdict.contradiction)
+        else:  # 理论上不会发生
+            contradiction = {"reason": "UNKNOWN", "message": "约束不成立", "witness": []}
+        candidate_failures = None
+        if verdict.chronology is not None:
+            candidate_failures = [
+                {
+                    "start_year": year,
+                    "reason": (
+                        verdict.per_candidate[year].contradiction.reason
+                        if verdict.per_candidate[year].contradiction
+                        else "UNKNOWN"
+                    ),
+                    "message": (
+                        verdict.per_candidate[year].contradiction.message
+                        if verdict.per_candidate[year].contradiction
+                        else "约束不成立"
+                    ),
+                }
+                for year in verdict.chronology.candidate_start_years
+                if not verdict.per_candidate[year].feasible
+            ]
+        raise _Infeasible(
+            {
+                "message": message,
+                "contradiction": contradiction,
+                "candidate_failures": candidate_failures,
+            }
+        )
+
+    def _feasible_or_reject(site_id: int, message_plain: str, message_chrono: str) -> None:
+        """事务内调用：无年表看原约束是否有解，有年表看是否仍有可行候选始年。"""
+        verdict = solve_site(conn, site_id)
+        if verdict.feasible:
+            return
+        _reject_infeasible(
+            site_id, message_chrono if verdict.chronology is not None else message_plain
+        )
+
+    def _conflict_from_info(info: dict[str, Any]) -> ConflictError:
+        details: dict[str, Any] = {
+            "contradiction": info["contradiction"],
+            "previous_solution": _solution_payload(info["site_id"]),
+        }
+        if info.get("candidate_failures") is not None:
+            details["candidate_failures"] = info["candidate_failures"]
+        return ConflictError(info["message"], details)
 
     # ---------- 遗址 ----------
 
@@ -152,19 +203,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         conn, site_id, body.trench, body.layer_no, body.note, intervals
                     )
                     db.bump_version(conn)
-                    if not load_and_solve(conn, site_id).feasible:
-                        _reject_infeasible(
-                            site_id, "新层位的年代段与现有约束无共同解，已拒绝录入"
-                        )
+                    _feasible_or_reject(
+                        site_id,
+                        "新层位的年代段与现有约束无共同解，已拒绝录入",
+                        "新层位使全部候选始年均不可行，已拒绝录入",
+                    )
             except _Infeasible as exc:
-                message, contradiction = exc.args[0]
-                raise ConflictError(
-                    message,
-                    {
-                        "contradiction": contradiction,
-                        "previous_solution": _solution_payload(site_id),
-                    },
-                )
+                info = exc.args[0]
+                info["site_id"] = site_id
+                raise _conflict_from_info(info)
             return {
                 "record": serialize_stratum(conn, row),
                 "solution": _solution_payload(site_id),
@@ -206,19 +253,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         conn, site_id, body.stratum_a_id, body.stratum_b_id
                     )
                     db.bump_version(conn)
-                    if not load_and_solve(conn, site_id).feasible:
-                        _reject_infeasible(
-                            site_id, "该对接会使约束无解（无法共用年份或叠压成环），已拒绝"
-                        )
+                    _feasible_or_reject(
+                        site_id,
+                        "该对接会使约束无解（无法共用年份或叠压成环），已拒绝",
+                        "该对接使全部候选始年均不可行，已拒绝",
+                    )
             except _Infeasible as exc:
-                message, contradiction = exc.args[0]
-                raise ConflictError(
-                    message,
-                    {
-                        "contradiction": contradiction,
-                        "previous_solution": _solution_payload(site_id),
-                    },
-                )
+                info = exc.args[0]
+                info["site_id"] = site_id
+                raise _conflict_from_info(info)
             return {"record": dict(row), "solution": _solution_payload(site_id)}
 
     @app.get("/sites/{site_id}/correlations", tags=["correlations"])
@@ -236,7 +279,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             with db.transaction(conn):
                 db.delete_correlation(conn, correlation_id)
                 db.bump_version(conn)
-            # 撤销只会放松约束，按剩余对接重算必然可行
+            # 撤销只会放松约束，按剩余对接重算必然可行；
+            # 此前不可行的候选始年也会随重算自动回到结果中
             return {"deleted": correlation_id, "solution": _solution_payload(site_id)}
 
     # ---------- 叠压 ----------
@@ -257,19 +301,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         conn, site_id, body.lower_id, body.upper_id
                     )
                     db.bump_version(conn)
-                    if not load_and_solve(conn, site_id).feasible:
-                        _reject_infeasible(
-                            site_id, "该叠压关系无解（成环或下层沉积年晚于上层），已拒绝"
-                        )
+                    _feasible_or_reject(
+                        site_id,
+                        "该叠压关系无解（成环或下层沉积年晚于上层），已拒绝",
+                        "该叠压关系使全部候选始年均不可行，已拒绝",
+                    )
             except _Infeasible as exc:
-                message, contradiction = exc.args[0]
-                raise ConflictError(
-                    message,
-                    {
-                        "contradiction": contradiction,
-                        "previous_solution": _solution_payload(site_id),
-                    },
-                )
+                info = exc.args[0]
+                info["site_id"] = site_id
+                raise _conflict_from_info(info)
             return {"record": dict(row), "solution": _solution_payload(site_id)}
 
     @app.get("/sites/{site_id}/superpositions", tags=["superpositions"])
@@ -289,25 +329,78 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 db.bump_version(conn)
             return {"deleted": superposition_id, "solution": _solution_payload(site_id)}
 
+    # ---------- 浮动树轮年表 ----------
+
+    @app.put(
+        "/sites/{site_id}/chronology",
+        tags=["chronology"],
+        operation_id="put_chronology",
+    )
+    @app.post(
+        "/sites/{site_id}/chronology",
+        tags=["chronology"],
+        operation_id="post_chronology",
+    )
+    def put_chronology(site_id: int, body: ChronologyPut):
+        """提交/整份替换该遗址的浮动树轮年表（每处遗址只保留一份）。
+
+        全部候选始年都不可行时返回 409，库内保留原年表与地层结论。
+        """
+        _require_site(site_id)
+        with write_lock:
+            for sample in body.samples:
+                _require_stratum(sample.stratum_id, site_id)
+            try:
+                with db.transaction(conn):
+                    db.replace_chronology(
+                        conn,
+                        site_id,
+                        body.candidate_start_years,
+                        [(s.stratum_id, s.offset_years) for s in body.samples],
+                    )
+                    db.bump_version(conn)
+                    _feasible_or_reject(
+                        site_id,
+                        "该浮动年表与现有约束无共同解，已拒绝",
+                        "该年表的全部候选始年均不可行，已保留原年表与地层结论",
+                    )
+            except _Infeasible as exc:
+                info = exc.args[0]
+                info["site_id"] = site_id
+                raise _conflict_from_info(info)
+            return {
+                "record": _chronology_record(site_id),
+                "solution": _solution_payload(site_id),
+            }
+
+    @app.get("/sites/{site_id}/chronology", tags=["chronology"])
+    def get_site_chronology(site_id: int):
+        _require_site(site_id)
+        record = _chronology_record(site_id)
+        if record is None:
+            raise HTTPException(404, f"遗址 {site_id} 尚未提交浮动树轮年表")
+        return record
+
     # ---------- 查询 ----------
 
     @app.get("/sites/{site_id}/solution", tags=["query"])
     def get_solution(site_id: int):
-        """整站分组、组间叠压边与每组可同时成立的全部年代段。"""
+        """整站分组、组间叠压边、可行候选始年，以及各组在可行始年下的年代段并集。"""
         _require_site(site_id)
         with write_lock:  # 读也排队在写之后，保证读到的是完整已提交状态
             return _solution_payload(site_id)
 
     @app.get("/strata/{stratum_id}/correlation-view", tags=["query"])
     def get_stratum_correlation_view(stratum_id: int):
-        """按原始层位查询：同组全部成员 + 该组可与其他层位同时成立的全部年代段。"""
+        """按原始层位查询：同组成员 + 该组在可行始年下可与其他层位同时成立的年代段并集。"""
         row = db.get_stratum(conn, stratum_id)
         if row is None:
             raise HTTPException(404, f"层位 {stratum_id} 不存在")
         site_id = row["site_id"]
         with write_lock:
-            solution = load_and_solve(conn, site_id)
+            verdict = solve_site(conn, site_id)
             version = db.get_version(conn)
+        solution = verdict.solution
         gid = solution.group_of[stratum_id]
         group = next(g for g in solution.groups if g.group_id == gid)
         members = [
@@ -318,13 +411,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "stratum_id": stratum_id,
             "group_id": gid,
             "version": version,
-            "feasible": solution.feasible,
+            "feasible": verdict.feasible,
             "members": members,
             "group_domain": [[lo, hi] for lo, hi in group.domain],
             "feasible_years": [[lo, hi] for lo, hi in group.feasible_years],
             "earliest_year": group.earliest_year,
             "latest_year": group.latest_year,
-            "contradiction": serialize_solution(solution, version)["contradiction"],
+            "feasible_start_years": verdict.feasible_start_years,
+            "contradiction": serialize_solution(verdict, version)["contradiction"],
         }
 
     @app.exception_handler(ConflictError)

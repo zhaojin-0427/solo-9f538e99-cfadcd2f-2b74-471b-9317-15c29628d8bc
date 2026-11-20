@@ -5,11 +5,17 @@
 1. 层位通过对接关系（无向）合并为连通组，同组视为同一次沉积，必须共用一个年份。
 2. 组的可能年代域 = 组内各层位年代段（整年闭区间，可含空档）的交集。
 3. 叠压关系（下层 -> 上层，严格）提升为组间边；成环（含同组自环）即无解。
-4. 在有向无环图上做两次贪心：
-   - 最早解 E：拓扑序，每个组取域内满足 ``y > max(E[前驱])`` 的最小年份；
-   - 最晚解 L：逆拓扑序，每个组取域内满足 ``y < min(L[后继])`` 的最大年份。
-   任意可行解 F 都满足 E <= F <= L（分量意义），因此组 g 的全部可同时成立年份
-   恰为其年代域与闭区间 [E[g], L[g]] 的交集（仍可为含空档的若干闭区间）。
+4. 可选钉年（浮动树轮年表）：pins 把指定层位所属组的沉积年钉死在固定年份
+   （候选始年 + 木样末轮偏移）。同组被钉到两个不同年份、钉年落在组域之外、
+   或钉年与叠压次序矛盾，均判无解。
+5. 在有向无环图上做两次贪心：
+   - 最早解 E：拓扑序，每个组取域内满足 ``y > max(E[前驱])`` 的最小年份
+     （被钉年的组取钉年，且钉年不得小于该下界）；
+   - 最晚解 L：逆拓扑序，每个组取域内满足 ``y < min(L[后继])`` 的最大年份
+     （被钉年的组取钉年，且钉年不得大于该上界）。
+   两次贪心都成功 <=> 系统可行；此时 E、L 各自都是一套完整解，任意可行解 F
+   都满足 E <= F <= L（分量意义），因此组 g 的全部可同时成立年份恰为其年代域
+   与闭区间 [E[g], L[g]] 的交集（仍可为含空档的若干闭区间；被钉年的组恰为钉年）。
 """
 
 from __future__ import annotations
@@ -112,17 +118,32 @@ class SuperpositionInput:
 
 
 @dataclass(frozen=True)
+class PinInput:
+    """木样钉年：把某层位所属组的沉积年钉死在固定年份。
+
+    年份 = 候选始年 + 木样末轮距年表起点的整年偏移（仅纳入砍伐年可视为
+    该层沉积年的木样，故钉年即该层沉积年）。
+    """
+
+    sample_id: int  # 木样记录 id（矛盾见证用）
+    stratum_id: int
+    year: int
+    detail: str  # 展示用描述
+
+
+@dataclass(frozen=True)
 class WitnessRecord:
     """矛盾见证中的一条原始记录。"""
 
-    kind: str  # stratum | correlation | superposition
+    kind: str  # stratum | correlation | superposition | sample
     record_id: int
     detail: str
 
 
 @dataclass(frozen=True)
 class Contradiction:
-    reason: str  # EMPTY_DOMAIN | GROUP_CYCLE | ORDER_CONFLICT
+    # EMPTY_DOMAIN | GROUP_CYCLE | ORDER_CONFLICT | PIN_CONFLICT | PIN_OUT_OF_DOMAIN
+    reason: str
     message: str
     witness: list[WitnessRecord]
 
@@ -182,8 +203,13 @@ def solve(
     strata: list[StratumInput],
     correlations: list[CorrelationInput],
     superpositions: list[SuperpositionInput],
+    pins: Optional[list[PinInput]] = None,
 ) -> Solution:
-    """对单个遗址的全部记录求解。"""
+    """对单个遗址的全部记录求解。
+
+    ``pins`` 为空时即原行为；给定pins时，同一遗址的全部钉年共用同一个
+    候选始年（互不连通的层位也一样），存在完整解才判可行。
+    """
     strata_by_id = {s.id: s for s in strata}
     uf = _UnionFind([s.id for s in strata])
     for corr in correlations:
@@ -313,6 +339,51 @@ def solve(
             ),
         )
 
+    # 3.5) 木样钉年（浮动树轮年表）：同组钉年须一致，且钉年须落在组域内
+    group_pins: dict[int, PinInput] = {}
+    for pin in sorted(pins or [], key=lambda p: (p.stratum_id, p.sample_id)):
+        gid = gid_of(pin.stratum_id)
+        existing = group_pins.get(gid)
+        if existing is not None:
+            if existing.year != pin.year:
+                witness = _group_member_witness(gid, members, strata_by_id)
+                witness.append(
+                    WitnessRecord("sample", existing.sample_id, existing.detail)
+                )
+                witness.append(WitnessRecord("sample", pin.sample_id, pin.detail))
+                return Solution(
+                    feasible=False,
+                    groups=base_groups_result(),
+                    group_edges=group_edges,
+                    group_of=group_of,
+                    contradiction=Contradiction(
+                        "PIN_CONFLICT",
+                        f"同一次沉积被两枚木样钉到不同年份"
+                        f"（{existing.year} 与 {pin.year}）",
+                        witness,
+                    ),
+                )
+            continue  # 同年重复钉年，保留首枚木样
+        group_pins[gid] = pin
+
+    for gid in sorted(group_pins):
+        pin = group_pins[gid]
+        if not any(lo <= pin.year <= hi for lo, hi in group_domain[gid]):
+            witness = _group_member_witness(gid, members, strata_by_id)
+            witness.append(WitnessRecord("sample", pin.sample_id, pin.detail))
+            return Solution(
+                feasible=False,
+                groups=base_groups_result(),
+                group_edges=group_edges,
+                group_of=group_of,
+                contradiction=Contradiction(
+                    "PIN_OUT_OF_DOMAIN",
+                    f"木样把该组沉积年钉在 {pin.year}，"
+                    f"落在组内年代段交集之外",
+                    witness,
+                ),
+            )
+
     predecessors: dict[int, list[int]] = {gid: [] for gid in group_ids}
     successors: dict[int, list[int]] = {gid: list(adj[gid]) for gid in group_ids}
     for u in group_ids:
@@ -322,7 +393,7 @@ def solve(
         predecessors[gid].sort()
         successors[gid].sort()
 
-    # 4) 最早解（拓扑序贪心）
+    # 4) 最早解（拓扑序贪心；被钉年的组只能取钉年）
     earliest: dict[int, int] = {}
     for gid in topo:
         bound = group_domain[gid][0][0]
@@ -330,6 +401,26 @@ def solve(
             candidate = earliest[pred] + 1
             if candidate > bound:
                 bound = candidate
+        pin = group_pins.get(gid)
+        if pin is not None:
+            if pin.year < bound:
+                return Solution(
+                    feasible=False,
+                    groups=base_groups_result(),
+                    group_edges=group_edges,
+                    group_of=group_of,
+                    contradiction=Contradiction(
+                        "ORDER_CONFLICT",
+                        f"组 {gid} 的沉积年被木样钉在 {pin.year}，"
+                        f"但叠压关系要求不早于 {bound}",
+                        _chain_witness(
+                            gid, raw_edges, members,
+                            strata_by_id, superpositions, group_pins,
+                        ),
+                    ),
+                )
+            earliest[gid] = pin.year
+            continue
         value = first_ge(group_domain[gid], bound)
         if value is None:
             return Solution(
@@ -343,13 +434,13 @@ def solve(
                     f"但叠压关系要求不早于 {bound}",
                     _chain_witness(
                         gid, raw_edges, members,
-                        strata_by_id, superpositions,
+                        strata_by_id, superpositions, group_pins,
                     ),
                 ),
             )
         earliest[gid] = value
 
-    # 5) 最晚解（逆拓扑序贪心）
+    # 5) 最晚解（逆拓扑序贪心；被钉年的组只能取钉年）
     latest: dict[int, int] = {}
     for gid in reversed(topo):
         bound = group_domain[gid][-1][1]
@@ -357,6 +448,26 @@ def solve(
             candidate = latest[succ] - 1
             if candidate < bound:
                 bound = candidate
+        pin = group_pins.get(gid)
+        if pin is not None:
+            if pin.year > bound:
+                return Solution(
+                    feasible=False,
+                    groups=base_groups_result(),
+                    group_edges=group_edges,
+                    group_of=group_of,
+                    contradiction=Contradiction(
+                        "ORDER_CONFLICT",
+                        f"组 {gid} 的沉积年被木样钉在 {pin.year}，"
+                        f"但叠压关系要求不晚于 {bound}",
+                        _chain_witness(
+                            gid, raw_edges, members,
+                            strata_by_id, superpositions, group_pins,
+                        ),
+                    ),
+                )
+            latest[gid] = pin.year
+            continue
         value = last_le(group_domain[gid], bound)
         if value is None:
             return Solution(
@@ -370,7 +481,7 @@ def solve(
                     f"但叠压关系要求不晚于 {bound}",
                     _chain_witness(
                         gid, raw_edges, members,
-                        strata_by_id, superpositions,
+                        strata_by_id, superpositions, group_pins,
                     ),
                 ),
             )
@@ -486,6 +597,7 @@ def _chain_witness(
     members: dict[int, list[int]],
     strata_by_id: dict[int, StratumInput],
     superpositions: list[SuperpositionInput],
+    group_pins: Optional[dict[int, PinInput]] = None,
 ) -> list[WitnessRecord]:
     """收集与冲突组处于同一弱连通分量的全部原始记录（本身即矛盾子集）。
 
@@ -527,6 +639,11 @@ def _chain_witness(
                 f"{strata_by_id[sup.upper_id].code}（上）",
             )
         )
+    # 约束链上被钉年的组，把对应木样也列入见证
+    for gid in sorted(seen_nodes):
+        pin = (group_pins or {}).get(gid)
+        if pin is not None:
+            witness.append(WitnessRecord("sample", pin.sample_id, pin.detail))
     return witness
 
 
